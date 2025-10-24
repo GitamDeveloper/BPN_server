@@ -1,18 +1,16 @@
 {
-  "name": "render-vpn-proxy",
+  "name": "bpn",
   "version": "1.0.0",
-  "description": "VPN Proxy for Render.com",
+  "description": "BPN - Blog Protocol Network",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "client": "node client.js"
+    "client": "node bpn-client.js", 
+    "check": "node check-bpn.js"
   },
   "dependencies": {
     "express": "^4.18.2",
-    "socksv5": "^0.0.6",
+    "socks": "^2.7.1",
     "axios": "^1.6.0"
-  },
-  "engines": {
-    "node": ">=18.0.0"
   }
 }
