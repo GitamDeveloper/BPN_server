@@ -11,7 +11,7 @@ app.use(express.text({ type: '*/*' }));
 
 class BPNServer {
   constructor() {
-    this.password = process.env.BPN_PASSWORD || 'bpn_password_123';
+    this.password = process.env.VPN_PASSWORD || 'bpn_password_123';
     console.log('🔐 Server password:', this.password);
     console.log('🚀 BPN Server starting...');
   }
