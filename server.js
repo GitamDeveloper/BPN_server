@@ -1,251 +1,192 @@
 const express = require('express');
 const net = require('net');
-const { URL } = require('url');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
+app.use(express.raw({ type: '*/*', limit: '10mb' }));
+
+// Middleware для логирования
+app.use((req, res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
+  next();
+});
 
 class BPNServer {
-  constructor() {
-    console.log('🚀 BPN Server starting...');
-  }
-
   setupRoutes() {
-    // Главная страница
+    // Health check
     app.get('/', (req, res) => {
-      res.json({ 
-        status: 'BPN Server is running!',
-        service: 'Blog Protocol Network',
-        endpoints: {
-          '/ip': 'Get your BPN IP',
-          '/proxy?url=...': 'HTTP proxy',
-          '/tunnel': 'TCP tunnel (POST)',
-          '/test': 'Test connectivity'
-        }
+      res.json({
+        status: 'operational',
+        service: 'BPN',
+        version: '1.0.0',
+        uptime: process.uptime()
       });
     });
 
-    // Получение IP через BPN
-    app.get('/ip', async (req, res) => {
-      try {
-        console.log('🌍 Fetching IP via BPN...');
-        
-        const socket = new net.Socket();
-        const response = await new Promise((resolve, reject) => {
-          let data = '';
-          
-          socket.connect(80, 'api.ipify.org', () => {
-            console.log('✅ Connected to api.ipify.org');
-            socket.write('GET / HTTP/1.1\r\nHost: api.ipify.org\r\nConnection: close\r\n\r\n');
-          });
-          
-          socket.on('data', (chunk) => {
-            data += chunk.toString();
-          });
-          
-          socket.on('close', () => {
-            console.log('📨 Received response from api.ipify.org');
-            resolve(data);
-          });
-          
-          socket.on('error', reject);
-          
-          socket.setTimeout(8000, () => {
-            socket.destroy();
-            resolve(data);
-          });
-        });
-
-        const ipMatch = response.match(/\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/);
-        const ip = ipMatch ? ipMatch[0] : 'Unknown';
-
-        res.json({
-          success: true,
-          your_bpn_ip: ip,
-          location: 'Frankfurt, Germany',
-          raw_response: response.substring(0, 200) + '...'
-        });
-
-      } catch (err) {
-        console.log('❌ IP fetch error:', err.message);
-        res.status(500).json({
-          success: false,
-          error: err.message
-        });
-      }
-    });
-
-    // HTTP прокси
-    app.get('/proxy', async (req, res) => {
-      const { url } = req.query;
-      
-      if (!url) {
-        return res.status(400).json({ error: 'URL parameter required' });
-      }
-
-      try {
-        console.log(`🌐 Proxying: ${url}`);
-        
-        const targetUrl = url.startsWith('http') ? url : `http://${url}`;
-        const parsedUrl = new URL(targetUrl);
-        
-        const host = parsedUrl.hostname;
-        const port = parsedUrl.port || 80;
-        const path = parsedUrl.pathname + parsedUrl.search;
-
-        const socket = new net.Socket();
-        const response = await new Promise((resolve, reject) => {
-          let responseData = Buffer.alloc(0);
-
-          socket.connect(port, host, () => {
-            console.log(`✅ Connected to ${host}`);
-            const request = `GET ${path} HTTP/1.1\r\nHost: ${host}\r\nConnection: close\r\nUser-Agent: BPN-Proxy/1.0\r\n\r\n`;
-            socket.write(request);
-          });
-
-          socket.on('data', (chunk) => {
-            responseData = Buffer.concat([responseData, chunk]);
-          });
-
-          socket.on('close', () => resolve(responseData));
-          socket.on('error', reject);
-          socket.setTimeout(10000, () => {
-            socket.destroy();
-            resolve(responseData);
-          });
-        });
-
-        // Отправляем raw HTTP ответ
-        res.setHeader('X-BPN-Proxy', 'true');
-        res.send(response);
-
-      } catch (err) {
-        console.log('❌ Proxy error:', err.message);
-        res.status(500).json({ error: err.message });
-      }
-    });
-
-    // TCP туннель для любых протоколов
+    // TCP туннель - основной endpoint
     app.post('/tunnel', async (req, res) => {
-      const { host, port = 80, data, protocol = 'http' } = req.body;
+      const { host, port = 80, data } = req.body;
       
       if (!host) {
         return res.status(400).json({ error: 'Host required' });
       }
 
+      const socket = new net.Socket();
+      let isResponded = false;
+
+      const cleanup = () => {
+        if (!socket.destroyed) {
+          socket.destroy();
+        }
+      };
+
+      const sendResponse = (response) => {
+        if (!isResponded) {
+          isResponded = true;
+          res.json(response);
+        }
+      };
+
+      const sendError = (error) => {
+        if (!isResponded) {
+          isResponded = true;
+          res.status(500).json({ error: error.message });
+        }
+      };
+
       try {
-        console.log(`🔗 Tunnel to ${host}:${port} (${protocol})`);
-        
-        const socket = new net.Socket();
-        const result = await new Promise((resolve, reject) => {
-          let response = Buffer.alloc(0);
-
-          socket.connect(port, host, () => {
-            console.log(`✅ Tunnel connected to ${host}:${port}`);
-            
-            if (data) {
-              const requestData = Buffer.from(data, 'base64');
-              socket.write(requestData);
-            } else if (protocol === 'http') {
-              // Авто HTTP запрос
-              socket.write(`GET / HTTP/1.1\r\nHost: ${host}\r\nConnection: close\r\n\r\n`);
-            }
-          });
-
-          socket.on('data', (chunk) => {
-            response = Buffer.concat([response, chunk]);
-          });
-
-          socket.on('close', () => {
-            console.log(`📨 Tunnel received ${response.length} bytes`);
-            resolve(response);
-          });
-
-          socket.on('error', reject);
-          socket.setTimeout(10000, () => {
-            socket.destroy();
-            resolve(response);
-          });
+        socket.connect(port, host, () => {
+          if (data) {
+            const requestData = Buffer.from(data, 'base64');
+            socket.write(requestData);
+          }
         });
 
-        res.json({
-          success: true,
-          data: result.toString('base64'),
-          bytes: result.length,
-          host: host,
-          port: port
+        let responseBuffer = Buffer.alloc(0);
+        
+        socket.on('data', (chunk) => {
+          responseBuffer = Buffer.concat([responseBuffer, chunk]);
+        });
+
+        socket.on('close', () => {
+          sendResponse({
+            success: true,
+            data: responseBuffer.toString('base64'),
+            bytes: responseBuffer.length
+          });
+          cleanup();
+        });
+
+        socket.on('error', (err) => {
+          sendError(err);
+          cleanup();
+        });
+
+        socket.setTimeout(15000, () => {
+          sendResponse({
+            success: true,
+            data: responseBuffer.toString('base64'),
+            bytes: responseBuffer.length,
+            timeout: true
+          });
+          cleanup();
         });
 
       } catch (err) {
-        console.log('❌ Tunnel error:', err.message);
-        res.status(500).json({
-          success: false,
-          error: err.message
-        });
+        sendError(err);
+        cleanup();
       }
     });
 
-    // Тест связности
-    app.get('/test', async (req, res) => {
-      const testSites = [
-        { name: 'Google', host: 'google.com', path: '/' },
-        { name: 'GitHub', host: 'github.com', path: '/' },
-        { name: 'Cloudflare', host: 'cloudflare.com', path: '/' },
-        { name: 'IPify', host: 'api.ipify.org', path: '/' }
-      ];
-
-      const results = [];
-
-      for (const site of testSites) {
-        try {
-          const start = Date.now();
-          const socket = new net.Socket();
-
-          await new Promise((resolve, reject) => {
-            socket.connect(80, site.host, resolve);
-            socket.on('error', reject);
-            socket.setTimeout(5000, () => reject(new Error('timeout')));
-          });
-
-          const latency = Date.now() - start;
-          socket.destroy();
-
-          results.push({
-            site: site.name,
-            status: '✅ Reachable',
-            latency: `${latency}ms`,
-            host: site.host
-          });
-
-        } catch (err) {
-          results.push({
-            site: site.name,
-            status: '❌ Unreachable',
-            error: err.message,
-            host: site.host
-          });
-        }
+    // HTTP прокси для простых запросов
+    app.all('/http/*', async (req, res) => {
+      const url = req.params[0];
+      if (!url) {
+        return res.status(400).json({ error: 'URL required' });
       }
 
+      try {
+        const targetUrl = url.startsWith('http') ? url : `http://${url}`;
+        const { hostname, port = 80, pathname, search } = new URL(targetUrl);
+        const path = pathname + search;
+
+        const requestHeaders = Object.entries(req.headers)
+          .filter(([key]) => !['host', 'connection'].includes(key.toLowerCase()))
+          .map(([key, value]) => `${key}: ${value}`)
+          .join('\r\n');
+
+        const requestData = [
+          `${req.method} ${path} HTTP/1.1`,
+          `Host: ${hostname}`,
+          'Connection: close',
+          requestHeaders,
+          '',
+          req.body && req.body.length ? req.body.toString() : ''
+        ].join('\r\n');
+
+        const response = await axios.post(`http://localhost:${PORT}/tunnel`, {
+          host: hostname,
+          port: parseInt(port),
+          data: Buffer.from(requestData).toString('base64')
+        });
+
+        if (response.data.success) {
+          const responseData = Buffer.from(response.data.data, 'base64');
+          const [headers, ...body] = responseData.toString().split('\r\n\r\n');
+          
+          // Парсим статус код
+          const statusLine = headers.split('\r\n')[0];
+          const statusCode = parseInt(statusLine.split(' ')[1]) || 200;
+          
+          // Устанавливаем заголовки
+          headers.split('\r\n').slice(1).forEach(header => {
+            const [key, value] = header.split(': ');
+            if (key && value) {
+              res.set(key, value);
+            }
+          });
+
+          res.status(statusCode).send(body.join('\r\n\r\n'));
+        } else {
+          res.status(502).json({ error: 'Proxy error' });
+        }
+
+      } catch (err) {
+        res.status(500).json({ error: err.message });
+      }
+    });
+
+    // Получение IP клиента
+    app.get('/ip', (req, res) => {
       res.json({
-        success: true,
-        bpn_connectivity_test: results,
-        message: 'BPN network test completed'
+        ip: req.ip,
+        forwarded: req.headers['x-forwarded-for'],
+        country: 'DE',
+        city: 'Frankfurt',
+        service: 'BPN'
       });
+    });
+
+    // Error handling
+    app.use((err, req, res, next) => {
+      console.error('Server error:', err);
+      res.status(500).json({ error: 'Internal server error' });
+    });
+
+    app.use('*', (req, res) => {
+      res.status(404).json({ error: 'Endpoint not found' });
     });
   }
 
   start() {
     this.setupRoutes();
+    
     app.listen(PORT, '0.0.0.0', () => {
-      console.log(`🎉 BPN Server running on port ${PORT}`);
-      console.log('💡 Available endpoints:');
-      console.log('   /ip     - Get your BPN IP');
-      console.log('   /proxy  - HTTP proxy (?url=...)');
-      console.log('   /tunnel - TCP tunnel (POST)');
-      console.log('   /test   - Network test');
+      console.log(`🚀 BPN Server v1.0.0 running on port ${PORT}`);
+      console.log('📍 Location: Frankfurt, DE');
+      console.log('💡 Ready for production use');
     });
   }
 }
