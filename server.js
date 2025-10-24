@@ -1,194 +1,204 @@
 const express = require('express');
 const net = require('net');
+const dgram = require('dgram');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(express.json());
-app.use(express.raw({ type: '*/*', limit: '10mb' }));
+// Максимальная производительность
+app.use(express.raw({ 
+  type: '*/*', 
+  limit: '50mb',
+  verify: (req, res, buf) => { req.rawBody = buf; }
+}));
 
-// Middleware для логирования
-app.use((req, res, next) => {
-  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
-  next();
-});
+class HighSpeedBPN {
+  constructor() {
+    this.connectionPool = new Map();
+    this.stats = {
+      totalConnections: 0,
+      bytesTransferred: 0,
+      activeConnections: 0
+    };
+  }
 
-class BPNServer {
   setupRoutes() {
-    // Health check
-    app.get('/', (req, res) => {
-      res.json({
-        status: 'operational',
-        service: 'BPN',
-        version: '1.0.0',
-        uptime: process.uptime()
+    // UDP endpoint для DNS и быстрых запросов
+    app.post('/udp', async (req, res) => {
+      const { host, port = 53, data } = req.body;
+      
+      return new Promise((resolve) => {
+        const socket = dgram.createSocket('udp4');
+        const timeout = setTimeout(() => {
+          socket.close();
+          res.json({ success: false, error: 'UDP timeout' });
+          resolve();
+        }, 3000);
+
+        socket.on('message', (msg) => {
+          clearTimeout(timeout);
+          socket.close();
+          res.json({
+            success: true,
+            data: msg.toString('base64'),
+            bytes: msg.length
+          });
+          resolve();
+        });
+
+        socket.on('error', () => {
+          clearTimeout(timeout);
+          socket.close();
+          res.json({ success: false, error: 'UDP error' });
+          resolve();
+        });
+
+        if (data) {
+          const requestData = Buffer.from(data, 'base64');
+          socket.send(requestData, port, host);
+        }
       });
     });
 
-    // TCP туннель - основной endpoint
-    app.post('/tunnel', async (req, res) => {
-      const { host, port = 80, data } = req.body;
+    // Высокоскоростной TCP туннель
+    app.post('/fast-tunnel', async (req, res) => {
+      const { host, port = 80, data, connectionId } = req.body;
       
       if (!host) {
         return res.status(400).json({ error: 'Host required' });
       }
 
+      const startTime = Date.now();
       const socket = new net.Socket();
-      let isResponded = false;
-
-      const cleanup = () => {
-        if (!socket.destroyed) {
-          socket.destroy();
-        }
-      };
-
-      const sendResponse = (response) => {
-        if (!isResponded) {
-          isResponded = true;
-          res.json(response);
-        }
-      };
-
-      const sendError = (error) => {
-        if (!isResponded) {
-          isResponded = true;
-          res.status(500).json({ error: error.message });
-        }
-      };
+      
+      // Максимальная производительность
+      socket.setNoDelay(true); // Отключаем Nagle
+      socket.setTimeout(10000);
+      socket.setKeepAlive(true, 1000);
 
       try {
-        socket.connect(port, host, () => {
-          if (data) {
-            const requestData = Buffer.from(data, 'base64');
-            socket.write(requestData);
-          }
+        // Быстрое соединение с IP
+        await new Promise((resolve, reject) => {
+          socket.connect(port, host, resolve);
+          socket.once('error', reject);
+          
+          const timeout = setTimeout(() => {
+            reject(new Error('Connection timeout'));
+          }, 4000);
+          
+          socket.once('connect', () => {
+            clearTimeout(timeout);
+            resolve();
+          });
         });
 
         let responseBuffer = Buffer.alloc(0);
         
-        socket.on('data', (chunk) => {
-          responseBuffer = Buffer.concat([responseBuffer, chunk]);
-        });
+        // Мгновенная отправка данных
+        if (data) {
+          const requestData = Buffer.from(data, 'base64');
+          socket.write(requestData);
+          this.stats.bytesTransferred += requestData.length;
+        }
 
-        socket.on('close', () => {
-          sendResponse({
-            success: true,
-            data: responseBuffer.toString('base64'),
-            bytes: responseBuffer.length
-          });
-          cleanup();
-        });
+        // Быстрый сбор данных
+        const responsePromise = new Promise((resolve) => {
+          const chunks = [];
+          let totalSize = 0;
 
-        socket.on('error', (err) => {
-          sendError(err);
-          cleanup();
-        });
-
-        socket.setTimeout(15000, () => {
-          sendResponse({
-            success: true,
-            data: responseBuffer.toString('base64'),
-            bytes: responseBuffer.length,
-            timeout: true
-          });
-          cleanup();
-        });
-
-      } catch (err) {
-        sendError(err);
-        cleanup();
-      }
-    });
-
-    // HTTP прокси для простых запросов
-    app.all('/http/*', async (req, res) => {
-      const url = req.params[0];
-      if (!url) {
-        return res.status(400).json({ error: 'URL required' });
-      }
-
-      try {
-        const targetUrl = url.startsWith('http') ? url : `http://${url}`;
-        const { hostname, port = 80, pathname, search } = new URL(targetUrl);
-        const path = pathname + search;
-
-        const requestHeaders = Object.entries(req.headers)
-          .filter(([key]) => !['host', 'connection'].includes(key.toLowerCase()))
-          .map(([key, value]) => `${key}: ${value}`)
-          .join('\r\n');
-
-        const requestData = [
-          `${req.method} ${path} HTTP/1.1`,
-          `Host: ${hostname}`,
-          'Connection: close',
-          requestHeaders,
-          '',
-          req.body && req.body.length ? req.body.toString() : ''
-        ].join('\r\n');
-
-        const response = await axios.post(`http://localhost:${PORT}/tunnel`, {
-          host: hostname,
-          port: parseInt(port),
-          data: Buffer.from(requestData).toString('base64')
-        });
-
-        if (response.data.success) {
-          const responseData = Buffer.from(response.data.data, 'base64');
-          const [headers, ...body] = responseData.toString().split('\r\n\r\n');
-          
-          // Парсим статус код
-          const statusLine = headers.split('\r\n')[0];
-          const statusCode = parseInt(statusLine.split(' ')[1]) || 200;
-          
-          // Устанавливаем заголовки
-          headers.split('\r\n').slice(1).forEach(header => {
-            const [key, value] = header.split(': ');
-            if (key && value) {
-              res.set(key, value);
+          socket.on('data', (chunk) => {
+            chunks.push(chunk);
+            totalSize += chunk.length;
+            
+            // Для больших ответов - отправляем частично
+            if (totalSize > 100000) { // 100KB
+              const partialResponse = Buffer.concat(chunks);
+              chunks.length = 0; // Очищаем для следующих чанков
+              
+              // Можно реализовать стриминг для очень больших ответов
             }
           });
 
-          res.status(statusCode).send(body.join('\r\n\r\n'));
-        } else {
-          res.status(502).json({ error: 'Proxy error' });
-        }
+          socket.on('close', () => {
+            resolve(Buffer.concat(chunks));
+          });
 
-      } catch (err) {
-        res.status(500).json({ error: err.message });
+          socket.on('timeout', () => {
+            socket.destroy();
+            resolve(Buffer.concat(chunks));
+          });
+        });
+
+        const result = await responsePromise;
+        const duration = Date.now() - startTime;
+
+        this.stats.bytesTransferred += result.length;
+        this.stats.totalConnections++;
+
+        res.json({
+          success: true,
+          data: result.toString('base64'),
+          bytes: result.length,
+          duration: `${duration}ms`,
+          speed: `${Math.round(result.length / (duration || 1))} KB/s`
+        });
+
+      } catch (error) {
+        res.status(500).json({ 
+          error: error.message,
+          host: host
+        });
+      } finally {
+        if (!socket.destroyed) {
+          socket.destroy();
+        }
       }
     });
 
-    // Получение IP клиента
-    app.get('/ip', (req, res) => {
+    // Health check с статистикой
+    app.get('/stats', (req, res) => {
       res.json({
-        ip: req.ip,
-        forwarded: req.headers['x-forwarded-for'],
-        country: 'DE',
-        city: 'Frankfurt',
-        service: 'BPN'
+        status: 'high_performance',
+        version: '2.0.0',
+        uptime: process.uptime(),
+        ...this.stats,
+        memory: process.memoryUsage()
       });
     });
 
-    // Error handling
-    app.use((err, req, res, next) => {
-      console.error('Server error:', err);
-      res.status(500).json({ error: 'Internal server error' });
-    });
+    // Bulk processing для множественных запросов
+    app.post('/bulk', async (req, res) => {
+      const requests = req.body.requests || [];
+      const results = [];
 
-    app.use('*', (req, res) => {
-      res.status(404).json({ error: 'Endpoint not found' });
+      // Обрабатываем до 10 запросов параллельно
+      const concurrentRequests = requests.slice(0, 10).map(async (request) => {
+        try {
+          const response = await axios.post(`http://localhost:${PORT}/fast-tunnel`, request);
+          results.push({ ...response.data, host: request.host });
+        } catch (error) {
+          results.push({ error: error.message, host: request.host });
+        }
+      });
+
+      await Promise.all(concurrentRequests);
+      res.json({ results });
     });
   }
 
   start() {
     this.setupRoutes();
     
-    app.listen(PORT, '0.0.0.0', () => {
-      console.log(`🚀 BPN Server v1.0.0 running on port ${PORT}`);
-      console.log('📍 Location: Frankfurt, DE');
-      console.log('💡 Ready for production use');
+    const server = app.listen(PORT, '0.0.0.0', () => {
+      console.log(`🚀 BPN High-Speed Server on port ${PORT}`);
+      console.log('⚡ Optimized for full traffic tunneling');
+      console.log('📊 Ready for high-volume traffic');
     });
+
+    // Оптимизация сервера
+    server.keepAliveTimeout = 30000;
+    server.headersTimeout = 35000;
   }
 }
 
-new BPNServer().start();
+new HighSpeedBPN().start();
