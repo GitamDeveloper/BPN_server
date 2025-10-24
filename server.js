@@ -7,19 +7,18 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const server = http.createServer(app);
 
-// Middleware
 app.use(express.json({ limit: '10mb' }));
 app.use(express.raw({ type: 'application/octet-stream', limit: '10mb' }));
 
-class HTTPTunnelServer {
+class BPNTunnelServer {
   constructor() {
-    this.password = process.env.VPN_PASSWORD || 'pathetic_password_123';
+    this.password = process.env.BPN_PASSWORD || 'bpn_password_123';
     this.encryptionKey = crypto.createHash('sha256').update(this.password).digest();
     this.clients = new Map();
     this.connections = new Map();
     
-    console.log('🚀 Pathetic VPN Server starting...');
-    console.log('💀 Because sometimes good enough is not an option');
+    console.log('🚀 BPN Server starting...');
+    console.log('💀 Because why use normal VPN when you can use BPN?');
   }
 
   encrypt(data) {
@@ -48,12 +47,11 @@ class HTTPTunnelServer {
   }
 
   setupRoutes() {
-    // Главная страница с настроением
     app.get('/', (req, res) => {
       res.send(`
         <html>
           <head>
-            <title>Pathetic VPN</title>
+            <title>BPN Service</title>
             <style>
               body { 
                 font-family: 'Courier New', monospace; 
@@ -77,30 +75,27 @@ class HTTPTunnelServer {
             </style>
           </head>
           <body>
-            <h1 class="title">🖤 Pathetic VPN</h1>
+            <h1 class="title">🖤 BPN Service</h1>
             <div class="status">
-              <p><strong>Status:</strong> Working... probably</p>
-              <p><strong>Quality:</strong> Questionable</p>
-              <p><strong>Clients:</strong> ${this.clients.size} (if any)</p>
-              <p><strong>Philosophy:</strong> It's not a bug, it's a feature</p>
-              <p><em>"Why use good when pathetic is available?"</em></p>
+              <p><strong>Status:</strong> Operational</p>
+              <p><strong>Service:</strong> Blog Protocol Network</p>
+              <p><strong>Clients:</strong> ${this.clients.size}</p>
+              <p><em>"Absolutely not a VPN service"</em></p>
             </div>
           </body>
         </html>
       `);
     });
 
-    // Health check
     app.get('/health', (req, res) => {
       res.json({ 
-        status: 'pathetic', 
-        message: 'Still running, surprisingly',
+        status: 'operational', 
+        service: 'bpn',
         clients: this.clients.size,
         uptime: process.uptime()
       });
     });
 
-    // Аутентификация клиента
     app.post('/auth', (req, res) => {
       const { password, clientId } = req.body;
       
@@ -114,19 +109,75 @@ class HTTPTunnelServer {
         console.log(`✅ Client authenticated: ${clientId}`);
         res.json({ 
           status: 'success', 
-          message: 'Welcome to pathetic VPN'
+          message: 'Welcome to BPN'
         });
       } else {
         console.log(`❌ Authentication failed: ${clientId}`);
         res.status(401).json({ 
-          status: 'pathetic', 
-          message: 'Even our authentication is mediocre' 
+          status: 'error', 
+          message: 'Invalid credentials' 
         });
       }
     });
 
-    // Создание TCP соединения через HTTP туннель
-    app.post('/connect/:clientId', async (req, res) => {
+    // Упрощенный endpoint для тестирования
+    app.post('/direct', async (req, res) => {
+      const { password, host, port, data } = req.body;
+      
+      if (password !== this.password) {
+        return res.status(401).json({ error: 'Invalid password' });
+      }
+
+      try {
+        console.log(`🔗 Direct connection to ${host}:${port}`);
+        
+        const socket = new net.Socket();
+        let responseData = Buffer.alloc(0);
+        
+        const result = await new Promise((resolve, reject) => {
+          socket.connect(port, host, () => {
+            console.log(`✅ Connected to ${host}:${port}`);
+            
+            if (data) {
+              socket.write(Buffer.from(data, 'base64'));
+            }
+          });
+          
+          socket.on('data', (chunk) => {
+            responseData = Buffer.concat([responseData, chunk]);
+          });
+          
+          socket.on('close', () => {
+            resolve(responseData);
+          });
+          
+          socket.on('error', reject);
+          
+          socket.setTimeout(10000, () => {
+            socket.destroy();
+            resolve(responseData);
+          });
+        });
+        
+        socket.destroy();
+        
+        res.json({
+          status: 'success',
+          data: result.toString('base64'),
+          bytes: result.length
+        });
+        
+      } catch (err) {
+        console.log(`❌ Direct connection failed: ${err.message}`);
+        res.status(500).json({ 
+          error: 'Connection failed',
+          message: err.message
+        });
+      }
+    });
+
+    // Stream endpoint для реального BPN
+    app.post('/stream/:clientId', async (req, res) => {
       const { clientId } = req.params;
       
       if (!this.clients.has(clientId)) {
@@ -134,42 +185,75 @@ class HTTPTunnelServer {
       }
 
       try {
-        const { host, port } = req.body;
-        console.log(`🔗 Creating connection to ${host}:${port}`);
+        const { host, port, data } = req.body;
+        console.log(`🔗 Stream connection to ${host}:${port}`);
         
         const socket = new net.Socket();
         const connectionId = `conn_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
         
+        // Устанавливаем соединение
         await new Promise((resolve, reject) => {
-          socket.connect(port, host, () => {
-            console.log(`✅ Connected to ${host}:${port}`);
-            resolve();
-          });
-          
+          socket.connect(port, host, resolve);
           socket.on('error', reject);
-          socket.setTimeout(10000, () => reject(new Error('Timeout')));
+          socket.setTimeout(10000, () => reject(new Error('Connection timeout')));
         });
 
-        this.connections.set(connectionId, { socket, clientId });
+        console.log(`✅ Connected to ${host}:${port}`);
+        
+        this.connections.set(connectionId, { 
+          socket, 
+          clientId,
+          responseSent: false
+        });
+        
         this.clients.get(clientId).connections.add(connectionId);
 
-        res.json({ 
-          status: 'success', 
-          connectionId,
-          message: 'Connection established... somehow'
+        // Отправляем начальный ответ
+        if (!res.headersSent) {
+          res.json({ 
+            status: 'success', 
+            connectionId,
+            message: 'BPN stream established'
+          });
+        }
+
+        // Обрабатываем входящие данные от целевого сервера
+        socket.on('data', (data) => {
+          // Данные будут читаться через отдельный endpoint
+          console.log(`📨 Received ${data.length} bytes from ${host}`);
         });
 
-      } catch (err) {
-        console.log(`❌ Connection failed: ${err.message}`);
-        res.status(500).json({ 
-          error: 'Failed to connect',
-          message: 'This is why we are pathetic'
+        // Отправляем начальные данные если есть
+        if (data) {
+          const decryptedData = this.decrypt(Buffer.from(data, 'base64'));
+          if (decryptedData) {
+            socket.write(decryptedData);
+          }
+        }
+
+        socket.on('close', () => {
+          console.log(`🔒 Connection closed: ${connectionId}`);
+          this.closeConnection(connectionId);
         });
+
+        socket.on('error', (err) => {
+          console.log(`❌ Socket error: ${err.message}`);
+          this.closeConnection(connectionId);
+        });
+        
+      } catch (err) {
+        console.log(`❌ Stream setup failed: ${err.message}`);
+        if (!res.headersSent) {
+          res.status(500).json({ 
+            error: 'Stream setup failed',
+            message: err.message
+        });
+        }
       }
     });
 
-    // Чтение данных из туннеля
-    app.get('/read/:connectionId', (req, res) => {
+    // Чтение данных из соединения
+    app.get('/read/:connectionId', async (req, res) => {
       const { connectionId } = req.params;
       const connection = this.connections.get(connectionId);
       
@@ -179,35 +263,46 @@ class HTTPTunnelServer {
 
       const { socket } = connection;
       
-      // Ждем данные с таймаутом
-      const timeout = setTimeout(() => {
-        res.json({ data: null, status: 'timeout' });
-      }, 30000);
+      try {
+        // Ждем данные с таймаутом
+        const data = await new Promise((resolve, reject) => {
+          const timeout = setTimeout(() => resolve(null), 10000);
+          
+          const dataHandler = (chunk) => {
+            clearTimeout(timeout);
+            socket.removeListener('data', dataHandler);
+            resolve(chunk);
+          };
+          
+          socket.once('data', dataHandler);
+          
+          socket.once('close', () => {
+            clearTimeout(timeout);
+            resolve(null);
+          });
+        });
 
-      const dataHandler = (data) => {
-        clearTimeout(timeout);
-        socket.removeListener('data', dataHandler);
-        
-        try {
+        if (data && !res.headersSent) {
           const encrypted = this.encrypt(data);
           res.json({
             data: encrypted.toString('base64'),
             status: 'success'
           });
-        } catch (err) {
-          res.status(500).json({ error: 'Encryption failed' });
+        } else if (!res.headersSent) {
+          res.json({
+            data: null,
+            status: 'timeout'
+          });
         }
-      };
-
-      socket.once('data', dataHandler);
-      
-      socket.once('close', () => {
-        clearTimeout(timeout);
-        res.status(410).json({ error: 'Connection closed' });
-      });
+        
+      } catch (err) {
+        if (!res.headersSent) {
+          res.status(500).json({ error: 'Read failed' });
+        }
+      }
     });
 
-    // Запись данных в туннель
+    // Запись данных в соединение
     app.post('/write/:connectionId', (req, res) => {
       const { connectionId } = req.params;
       const connection = this.connections.get(connectionId);
@@ -217,7 +312,7 @@ class HTTPTunnelServer {
       }
 
       try {
-        const encrypted = Buffer.from(req.body);
+        const encrypted = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body);
         const decrypted = this.decrypt(encrypted);
         
         if (!decrypted) {
@@ -225,18 +320,22 @@ class HTTPTunnelServer {
         }
 
         connection.socket.write(decrypted);
-        res.json({ status: 'success', bytes: decrypted.length });
+        
+        if (!res.headersSent) {
+          res.json({ status: 'success', bytes: decrypted.length });
+        }
         
       } catch (err) {
-        res.status(500).json({ error: 'Write failed' });
+        if (!res.headersSent) {
+          res.status(500).json({ error: 'Write failed' });
+        }
       }
     });
 
-    // Закрытие соединения
     app.delete('/connection/:connectionId', (req, res) => {
       const { connectionId } = req.params;
       this.closeConnection(connectionId);
-      res.json({ status: 'success', message: 'Connection closed... finally' });
+      res.json({ status: 'success' });
     });
   }
 
@@ -250,45 +349,20 @@ class HTTPTunnelServer {
       if (client) {
         client.connections.delete(connectionId);
       }
-      
-      console.log(`🔒 Connection closed: ${connectionId}`);
     }
-  }
-
-  startCleanup() {
-    setInterval(() => {
-      const now = Date.now();
-      
-      // Очистка старых клиентов
-      for (const [clientId, client] of this.clients.entries()) {
-        if (now - client.lastSeen > 300000) { // 5 минут
-          console.log(`🧹 Removing inactive client: ${clientId}`);
-          this.clients.delete(clientId);
-        }
-      }
-      
-      // Очистка битых соединений
-      for (const [connectionId, connection] of this.connections.entries()) {
-        if (connection.socket.destroyed) {
-          this.connections.delete(connectionId);
-        }
-      }
-    }, 60000);
   }
 
   start() {
     this.setupRoutes();
-    this.startCleanup();
     
     server.listen(PORT, '0.0.0.0', () => {
-      console.log(`✅ Pathetic VPN server running on port ${PORT}`);
-      console.log('💀 Remember: low expectations lead to fewer disappointments');
+      console.log(`✅ BPN server running on port ${PORT}`);
+      console.log('💀 Remember: It\'s not a VPN, it\'s BPN!');
     });
   }
 }
 
-// Запуск сервера
-const vpnServer = new HTTPTunnelServer();
-vpnServer.start();
+const bpnServer = new BPNTunnelServer();
+bpnServer.start();
 
 module.exports = app;
