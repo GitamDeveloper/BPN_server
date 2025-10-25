@@ -1,94 +1,123 @@
-const express = require('express');
-const http = require('http');
-const net = require('net');
-const WebSocket = require('ws');
+import WebSocket, { WebSocketServer } from 'ws';
+import http from 'http';
+import https from 'https';
+import { URL } from 'url';
 
-const app = express();
-const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
-
-// Health check
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    connections: Array.from(wss.clients).length
-  });
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('WebSocket VPN Server is running\n');
 });
 
-// WebSocket connection for real-time tunneling
-wss.on('connection', (ws) => {
-  let targetSocket = null;
+const wss = new WebSocketServer({ server });
+
+// Храним активные соединения
+const clients = new Map();
+
+wss.on('connection', (ws, req) => {
+  const clientId = generateId();
+  clients.set(clientId, ws);
   
-  console.log('🔗 New WebSocket connection');
+  console.log(`Client connected: ${clientId}`);
   
   ws.on('message', async (data) => {
     try {
-      // First message should be connection info
-      if (!targetSocket) {
-        const connectInfo = JSON.parse(data);
-        const { host, port } = connectInfo;
-        
-        console.log(`🔗 Creating tunnel to ${host}:${port}`);
-        
-        targetSocket = new net.Socket();
-        targetSocket.setNoDelay(true);
-        
-        targetSocket.connect(port, host, () => {
-          console.log(`✅ Tunnel connected to ${host}:${port}`);
-          ws.send(JSON.stringify({ type: 'connected' }));
-        });
-        
-        targetSocket.on('data', (data) => {
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(data); // Send raw binary data
-          }
-        });
-        
-        targetSocket.on('close', () => {
-          console.log(`🔒 Tunnel to ${host}:${port} closed`);
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'closed' }));
-          }
-          ws.close();
-        });
-        
-        targetSocket.on('error', (err) => {
-          console.error(`Tunnel error to ${host}:${port}:`, err.message);
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'error', message: err.message }));
-          }
-          ws.close();
-        });
-        
-      } else {
-        // Subsequent messages are data to forward
-        if (targetSocket && !targetSocket.destroyed) {
-          targetSocket.write(data); // data is already a Buffer
-        }
-      }
+      const message = JSON.parse(data);
       
+      if (message.type === 'http-request') {
+        await handleHttpRequest(ws, message);
+      } else if (message.type === 'ping') {
+        ws.send(JSON.stringify({ type: 'pong' }));
+      }
     } catch (error) {
-      console.error('WebSocket message error:', error);
+      console.error('Error processing message:', error);
     }
   });
   
   ws.on('close', () => {
-    if (targetSocket) {
-      targetSocket.destroy();
-    }
-    console.log('🔒 WebSocket connection closed');
+    clients.delete(clientId);
+    console.log(`Client disconnected: ${clientId}`);
   });
   
-  ws.on('error', (err) => {
-    console.error('WebSocket error:', err);
-    if (targetSocket) {
-      targetSocket.destroy();
-    }
+  ws.on('error', (error) => {
+    console.error(`WebSocket error for client ${clientId}:`, error);
+    clients.delete(clientId);
   });
+  
+  // Отправляем приветственное сообщение
+  ws.send(JSON.stringify({
+    type: 'connected',
+    clientId: clientId,
+    message: 'Connected to WebSocket VPN'
+  }));
 });
 
-const PORT = process.env.PORT || 10000;
+async function handleHttpRequest(ws, message) {
+  const { requestId, url, method, headers, body } = message;
+  
+  try {
+    const parsedUrl = new URL(url);
+    const options = {
+      hostname: parsedUrl.hostname,
+      port: parsedUrl.port || (parsedUrl.protocol === 'https:' ? 443 : 80),
+      path: parsedUrl.pathname + parsedUrl.search,
+      method: method,
+      headers: { ...headers }
+    };
+    
+    // Удаляем неподдерживаемые заголовки
+    delete options.headers['host'];
+    delete options.headers['connection'];
+    
+    const protocol = parsedUrl.protocol === 'https:' ? https : http;
+    
+    const req = protocol.request(options, (res) => {
+      const responseData = {
+        type: 'http-response',
+        requestId: requestId,
+        statusCode: res.statusCode,
+        statusMessage: res.statusMessage,
+        headers: res.headers,
+        chunks: []
+      };
+      
+      res.on('data', (chunk) => {
+        responseData.chunks.push(chunk.toString('base64'));
+      });
+      
+      res.on('end', () => {
+        ws.send(JSON.stringify(responseData));
+      });
+    });
+    
+    req.on('error', (error) => {
+      ws.send(JSON.stringify({
+        type: 'error',
+        requestId: requestId,
+        error: error.message
+      }));
+    });
+    
+    // Отправляем тело запроса если есть
+    if (body) {
+      req.write(Buffer.from(body, 'base64'));
+    }
+    
+    req.end();
+    
+  } catch (error) {
+    ws.send(JSON.stringify({
+      type: 'error',
+      requestId: requestId,
+      error: error.message
+    }));
+  }
+}
+
+function generateId() {
+  return Math.random().toString(36).substring(2, 15);
+}
+
+const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`🚀 BPN Universal Server on port ${PORT}`);
-  console.log(`🔗 WebSocket tunneling ready`);
+  console.log(`WebSocket VPN Server running on port ${PORT}`);
 });
