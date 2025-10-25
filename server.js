@@ -1,93 +1,194 @@
 const express = require('express');
+const http = require('http');
 const net = require('net');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const server = http.createServer(app);
 
+// Middleware
 app.use(express.raw({ 
-  type: '*/*', 
-  limit: '100mb'
+  type: '*/*',
+  limit: '10mb'
 }));
 
-class UniversalBPN {
+class HTTPTunnelServer {
+  constructor() {
+    this.tcpConnections = new Map();
+    this.connectionId = 0;
+    this.maxConnections = 20;
+  }
+
   setupRoutes() {
-    // Универсальный TCP туннель
-    app.post('/connect', async (req, res) => {
-      const { host, port, data } = req.body;
-      
-      console.log(`🔗 Connecting to ${host}:${port}`);
-      
-      const socket = new net.Socket();
-      socket.setTimeout(15000);
-      socket.setNoDelay(true);
+    // Health check
+    app.get('/health', (req, res) => {
+      res.json({ 
+        status: 'ok', 
+        connections: this.tcpConnections.size,
+        maxConnections: this.maxConnections
+      });
+    });
+
+    // Создание нового TCP туннеля
+    app.post('/tunnel', async (req, res) => {
+      if (this.tcpConnections.size >= this.maxConnections) {
+        return res.status(503).json({ error: 'Connection limit reached' });
+      }
 
       try {
-        // Устанавливаем соединение
-        await new Promise((resolve, reject) => {
-          socket.connect(port || 80, host, resolve);
-          socket.once('error', reject);
-        });
-
-        console.log(`✅ Connected to ${host}:${port}`);
-
-        let response = Buffer.alloc(0);
-        
-        // Отправляем данные если есть
-        if (data) {
-          const requestData = Buffer.from(data, 'base64');
-          socket.write(requestData);
+        const { host, port } = req.query;
+        if (!host || !port) {
+          return res.status(400).json({ error: 'Missing host or port' });
         }
 
-        // Получаем ответ
-        const responseData = await new Promise((resolve) => {
-          socket.on('data', (chunk) => {
-            response = Buffer.concat([response, chunk]);
-          });
-
-          socket.on('close', () => resolve(response));
-          socket.on('timeout', () => {
-            socket.destroy();
-            resolve(response);
-          });
+        const connId = await this.createTCPTunnel(host, parseInt(port));
+        res.json({ 
+          connectionId: connId,
+          status: 'connected'
         });
-
-        console.log(`📨 Received ${responseData.length} bytes from ${host}`);
-
-        res.json({
-          success: true,
-          data: responseData.toString('base64'),
-          bytes: responseData.length
-        });
-
       } catch (error) {
-        console.log(`❌ Connection failed: ${host}:${port} - ${error.message}`);
-        res.status(500).json({ 
-          success: false,
-          error: error.message
-        });
-      } finally {
-        if (!socket.destroyed) {
-          socket.destroy();
-        }
+        res.status(500).json({ error: error.message });
       }
     });
 
-    // Health check
-    app.get('/', (req, res) => {
-      res.json({ 
-        status: 'BPN Universal Tunnel',
-        version: '3.0.0',
-        ready: true
+    // Отправка данных через туннель
+    app.post('/tunnel/:id/send', (req, res) => {
+      const connId = req.params.id;
+      const connection = this.tcpConnections.get(connId);
+
+      if (!connection) {
+        return res.status(404).json({ error: 'Connection not found' });
+      }
+
+      if (!req.body || req.body.length === 0) {
+        return res.status(400).json({ error: 'No data provided' });
+      }
+
+      try {
+        connection.socket.write(req.body);
+        res.json({ status: 'sent', bytes: req.body.length });
+      } catch (error) {
+        this.tcpConnections.delete(connId);
+        res.status(500).json({ error: 'Connection failed' });
+      }
+    });
+
+    // Получение данных из туннеля (long polling)
+    app.get('/tunnel/:id/receive', (req, res) => {
+      const connId = req.params.id;
+      const connection = this.tcpConnections.get(connId);
+
+      if (!connection) {
+        return res.status(404).json({ error: 'Connection not found' });
+      }
+
+      // Таймаут для long polling
+      const timeout = setTimeout(() => {
+        res.json({ data: null, status: 'timeout' });
+      }, 30000);
+
+      // Ожидаем данные
+      const dataHandler = (data) => {
+        clearTimeout(timeout);
+        connection.dataBuffer = connection.dataBuffer ? Buffer.concat([connection.dataBuffer, data]) : data;
+        
+        // Отправляем накопленные данные
+        res.json({
+          data: connection.dataBuffer.toString('base64'),
+          bytes: connection.dataBuffer.length
+        });
+        
+        connection.dataBuffer = null;
+      };
+
+      connection.socket.once('data', dataHandler);
+
+      // Обработка закрытия соединения
+      connection.socket.once('close', () => {
+        clearTimeout(timeout);
+        res.json({ status: 'closed' });
       });
+    });
+
+    // Закрытие туннеля
+    app.delete('/tunnel/:id', (req, res) => {
+      const connId = req.params.id;
+      this.closeTCPTunnel(connId);
+      res.json({ status: 'closed' });
     });
   }
 
-  start() {
-    this.setupRoutes();
-    app.listen(PORT, '0.0.0.0', () => {
-      console.log(`🚀 BPN Universal Server on port ${PORT}`);
+  async createTCPTunnel(host, port) {
+    return new Promise((resolve, reject) => {
+      const connId = (++this.connectionId).toString();
+      
+      const socket = new net.Socket();
+      socket.setTimeout(25000);
+      socket.setNoDelay(true);
+
+      socket.connect(port, host, () => {
+        const connection = {
+          id: connId,
+          socket: socket,
+          host: host,
+          port: port,
+          createdAt: Date.now()
+        };
+
+        this.tcpConnections.set(connId, connection);
+
+        socket.on('data', (data) => {
+          // Данные будут храниться до следующего poll запроса
+          if (!connection.dataBuffer) {
+            connection.dataBuffer = data;
+          } else {
+            connection.dataBuffer = Buffer.concat([connection.dataBuffer, data]);
+          }
+        });
+
+        socket.on('close', () => {
+          this.tcpConnections.delete(connId);
+        });
+
+        socket.on('error', () => {
+          this.tcpConnections.delete(connId);
+        });
+
+        socket.on('timeout', () => {
+          socket.destroy();
+          this.tcpConnections.delete(connId);
+        });
+
+        resolve(connId);
+      });
+
+      socket.on('error', reject);
     });
+  }
+
+  closeTCPTunnel(connId) {
+    const connection = this.tcpConnections.get(connId);
+    if (connection) {
+      connection.socket.destroy();
+      this.tcpConnections.delete(connId);
+    }
   }
 }
 
-new UniversalBPN().start();
+// Инициализация сервера
+const tunnelServer = new HTTPTunnelServer();
+tunnelServer.setupRoutes();
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+  console.log(`🚀 HTTP Tunnel Server running on port ${PORT}`);
+  console.log(`📍 Server location: Frankfurt (Render)`);
+  console.log(`📊 Max TCP connections: ${tunnelServer.maxConnections}`);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('🛑 Shutting down server...');
+  server.close(() => {
+    process.exit(0);
+  });
+});
