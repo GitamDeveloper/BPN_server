@@ -31,6 +31,16 @@ wss.on('connection', (ws) => {
   
   ws.on('message', async (data) => {
     try {
+      // Handle binary data directly
+      if (Buffer.isBuffer(data)) {
+        // Binary data - forward to target
+        if (targetSocket && !targetSocket.destroyed) {
+          targetSocket.write(data);
+        }
+        return;
+      }
+      
+      // Text data - parse as JSON for control messages
       const message = JSON.parse(data);
       
       if (message.type === 'connect') {
@@ -47,12 +57,9 @@ wss.on('connection', (ws) => {
         });
         
         targetSocket.on('data', (data) => {
-          // Send data back to client via WebSocket
+          // Send binary data back to client via WebSocket
           if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({
-              type: 'data',
-              data: data.toString('base64')
-            }));
+            ws.send(data); // Send as binary
           }
         });
         
@@ -66,18 +73,10 @@ wss.on('connection', (ws) => {
         
         targetSocket.on('error', (err) => {
           console.error(`Tunnel ${connId} error:`, err.message);
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'error', message: err.message }));
-          }
           connections.delete(connId);
         });
         
         connections.set(connId, { ws, targetSocket });
-        
-      } else if (message.type === 'data' && targetSocket) {
-        // Forward data to target
-        const buffer = Buffer.from(message.data, 'base64');
-        targetSocket.write(buffer);
       }
       
     } catch (error) {
